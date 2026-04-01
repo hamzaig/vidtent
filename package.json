@@ -1,0 +1,33 @@
+{
+  "name": "video-merge-tool",
+  "version": "1.0.0",
+  "description": "Config-driven FFmpeg video merge CLI with a local React frontend.",
+  "type": "module",
+  "bin": {
+    "video-tool": "./src/cli.js"
+  },
+  "scripts": {
+    "build": "vite build --config ./web/vite.config.js",
+    "cli": "node ./src/cli.js",
+    "dev": "concurrently \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "node ./src/server.js",
+    "dev:web": "vite --config ./web/vite.config.js",
+    "init": "node ./src/cli.js init",
+    "run": "node ./src/cli.js run ./examples/job.sample.json",
+    "start": "node ./src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.0",
+    "concurrently": "^9.2.1",
+    "vite": "^7.1.11"
+  }
+}

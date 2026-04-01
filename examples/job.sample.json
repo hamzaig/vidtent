@@ -1,0 +1,32 @@
+{
+  "output": "../output/final.mp4",
+  "workingDir": "../.video-tool-temp",
+  "removeAudio": false,
+  "video": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "crf": 20,
+    "preset": "medium"
+  },
+  "audio": {
+    "bitrate": "192k",
+    "sampleRate": 48000
+  },
+  "clips": [
+    {
+      "path": "../input/video-1.mp4",
+      "start": "00:00:01.000",
+      "end": "00:00:04.500",
+      "removeAudio": true
+    },
+    {
+      "path": "../input/video-2.mp4",
+      "start": 2,
+      "duration": 5
+    },
+    {
+      "path": "../input/video-3.mp4"
+    }
+  ]
+}

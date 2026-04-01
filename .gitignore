@@ -1,0 +1,7 @@
+node_modules
+web/dist
+.video-tool-temp
+.app-data
+output
+input
+tmp
