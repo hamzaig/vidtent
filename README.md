@@ -1,24 +1,83 @@
-# Video Merge Tool
+# AI Video Generation Workspace
 
-Local FFmpeg tool with:
+This repository is the working foundation for an AI-assisted video generation pipeline.
 
-- Node.js CLI for config-based jobs
+Target direction:
+
+- upload and arrange source video clips
+- generate AI-written content or narration scripts from a prompt
+- convert generated script into AI voice using text-to-speech
+- align generated voice with video timing
+- let the editor fine-tune clip timing, cuts, and final export
+
+Important:
+
+- the current codebase is still focused on clip upload, visual trimming, reordering, muting, merging, and final export
+- AI content generation, AI voice generation, text-to-speech orchestration, and narration-to-video alignment are planned next-stage features
+- this README describes both the current base and the intended roadmap
+
+## Product vision
+
+The goal is to turn this project into a practical AI video assembly tool where a user can:
+
+1. upload raw clips
+2. provide a topic, prompt, or idea
+3. generate AI content for narration or scene guidance
+4. generate AI voiceover from that text
+5. sync the voiceover with the selected video timeline
+6. export a polished final video
+
+This means the project is moving beyond simple merging and toward a full AI-assisted video composition workflow.
+
+## Current foundation
+
+Right now the repository already provides:
+
+- Node.js CLI for FFmpeg-based batch jobs
+- local API server for browser uploads and processing
 - React frontend for non-technical users
-- local API server that handles uploads and output downloads
+- visual video preview and trimming
+- clip ordering, per-clip mute, full-output mute, and export
 
-The browser flow now works without manual file paths.
+This current layer is useful because it establishes:
 
-## Install
+- clip management
+- timeline editing basics
+- browser upload flow
+- final rendering/export flow
 
-```bash
-npm install
-```
+These are the pieces the future AI narration pipeline will build on top of.
 
-## Non-technical browser flow
+## Planned AI features
+
+The intended next phase is to add:
+
+- prompt-driven AI script generation
+- scene-wise AI content planning
+- text-to-speech voice generation
+- multiple AI voice styles
+- auto-alignment of generated narration with clip timing
+- optional subtitle generation from final narration
+- optional soundtrack and sound-design layer
+- timeline suggestions based on narration length
+
+Suggested high-level future flow:
+
+1. User uploads source clips.
+2. User enters a prompt or topic.
+3. System generates scene content or narration text.
+4. System generates AI voice from that text.
+5. System estimates or computes segment durations.
+6. System maps narration to video clips.
+7. User visually adjusts timing if needed.
+8. System renders the final video.
+
+## Current browser workflow
 
 Run the app:
 
 ```bash
+npm install
 npm run dev
 ```
 
@@ -28,17 +87,14 @@ Open:
 http://localhost:5173
 ```
 
-Then:
+Current browser flow:
 
-1. Click `Add Videos` or drag-and-drop video files.
-2. Change clip order with `Up` and `Down`.
-3. Fill `Start`, `End`, or `Duration` only where needed.
-4. Turn on `Mute only this clip` if a single clip audio remove karni ho.
-5. Turn on `Remove all audio from final video` if puri final video silent chahiye.
-6. Click `Merge Videos`.
-7. When processing completes, click `Download Final Video`.
-
-Uploaded source videos are handled by the local server, and the final file is downloaded from the browser.
+1. Upload clips with `Browse Videos` or drag and drop.
+2. Preview each clip directly in the browser.
+3. Set visual trims with sliders or player-based start/end controls.
+4. Reorder clips.
+5. Mute individual clips or mute the whole output.
+6. Merge and download the final video.
 
 ## Production build
 
@@ -47,13 +103,13 @@ npm run build
 npm start
 ```
 
-That serves the built frontend and API from:
+Built app runs at:
 
 ```text
 http://localhost:3001
 ```
 
-## CLI usage
+## Current CLI usage
 
 Generate a sample config:
 
@@ -67,14 +123,7 @@ Run a job:
 node ./src/cli.js run ./examples/job.sample.json
 ```
 
-Or install the CLI globally inside this folder:
-
-```bash
-npm link
-video-tool run ./examples/job.sample.json
-```
-
-## CLI config format
+## Current CLI config format
 
 ```json
 {
@@ -113,10 +162,7 @@ video-tool run ./examples/job.sample.json
 
 ## Notes
 
-- Browser mode does not require entering file system paths.
-- CLI mode still supports path-based batch jobs.
-- `start`, `end`, and `duration` accept seconds or `HH:MM:SS(.ms)`.
-- `removeAudio` on a clip replaces only that clip's audio with silence.
-- top-level `removeAudio: true` makes the full output silent.
-- all clips are normalized to one output size and FPS before merge so mixed inputs can still be combined.
-# vidtent
+- Browser mode currently focuses on video upload, preview, trimming, and export.
+- CLI mode currently focuses on FFmpeg-driven merging and trimming.
+- AI voice, AI script, TTS, and narration alignment are not implemented yet in the repository.
+- The existing architecture is intended to serve as the base for those future features.

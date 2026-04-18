@@ -1,10 +1,17 @@
 import express from "express";
 import multer from "multer";
+import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { createBrowserJobDefaults, createSampleJob, runJob } from "./video-tool.js";
+import {
+  compressVideo,
+  createBrowserJobDefaults,
+  createSampleJob,
+  runJob
+} from "./video-tool.js";
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB_DIST_DIR = path.join(ROOT_DIR, "web", "dist");
@@ -14,12 +21,44 @@ const OUTPUTS_DIR = path.join(APP_DATA_DIR, "outputs");
 const TEMP_DIR = path.join(APP_DATA_DIR, "temp");
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]);
 const jobs = new Map();
+const compressStreamSessions = new Map();
+const COMPRESS_STREAM_CHUNK_BYTES = 16 * 1024 * 1024;
+const COMPRESS_STREAM_MAX_BYTES = 48 * 1024 * 1024 * 1024;
 
 await Promise.all([
   fs.mkdir(UPLOADS_DIR, { recursive: true }),
   fs.mkdir(OUTPUTS_DIR, { recursive: true }),
   fs.mkdir(TEMP_DIR, { recursive: true })
 ]);
+
+const compressUpload = multer({
+  storage: multer.diskStorage({
+    destination(request, _file, callback) {
+      const uploadId = request.uploadJobId;
+      const directory = path.join(UPLOADS_DIR, uploadId);
+
+      fs.mkdir(directory, { recursive: true })
+        .then(() => callback(null, directory))
+        .catch((error) => callback(error));
+    },
+    filename(_request, file, callback) {
+      callback(null, `${randomUUID()}-${sanitizeFilename(file.originalname)}`);
+    }
+  }),
+  fileFilter(_request, file, callback) {
+    const extension = path.extname(file.originalname).toLowerCase();
+
+    if (file.mimetype.startsWith("video/") || VIDEO_EXTENSIONS.has(extension)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error(`Unsupported file type: ${file.originalname}`));
+  },
+  limits: {
+    files: 1
+  }
+});
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -51,13 +90,22 @@ const upload = multer({
 });
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 app.get("/api/app-info", (_request, response) => {
   response.json({
     rootDir: ROOT_DIR,
     sampleJob: createSampleJob(),
-    browserDefaults: createBrowserJobDefaults()
+    browserDefaults: createBrowserJobDefaults(),
+    compressorDefaults: {
+      outputName: "compressed.mp4",
+      crf: 23,
+      preset: "medium",
+      audioBitrate: "128k",
+      convertFormat: false,
+      targetFormat: "mp4"
+    },
+    compressStreamChunkBytes: COMPRESS_STREAM_CHUNK_BYTES
   });
 });
 
@@ -106,6 +154,192 @@ app.post("/api/jobs", async (request, response, next) => {
     next(error);
   }
 });
+
+app.post("/api/jobs/compress-stream/init", async (request, response, next) => {
+  try {
+    const { originalName, totalBytes, metadata: rawMeta } = request.body || {};
+
+    if (!originalName || typeof originalName !== "string") {
+      response.status(400).json({ error: "originalName is required." });
+      return;
+    }
+
+    const extension = path.extname(originalName).toLowerCase();
+
+    if (!extension || !VIDEO_EXTENSIONS.has(extension)) {
+      response.status(400).json({ error: `Unsupported file extension: ${extension || "(none)"}` });
+      return;
+    }
+
+    const expectedTotalBytes = Number(totalBytes);
+
+    if (!Number.isFinite(expectedTotalBytes) || expectedTotalBytes <= 0) {
+      response.status(400).json({ error: "totalBytes must be the file size in bytes (positive number)." });
+      return;
+    }
+
+    if (expectedTotalBytes > COMPRESS_STREAM_MAX_BYTES) {
+      response.status(400).json({ error: "File exceeds maximum allowed size for streaming upload." });
+      return;
+    }
+
+    const jobId = randomUUID();
+    const dirPath = path.join(UPLOADS_DIR, jobId);
+    await fs.mkdir(dirPath, { recursive: true });
+
+    const metadata = parseCompressMetadataFromInitBody(rawMeta ?? {});
+    const inputPath = path.join(dirPath, `input${extension}`);
+
+    compressStreamSessions.set(jobId, {
+      dirPath,
+      originalName,
+      metadata,
+      inputPath,
+      nextChunkIndex: 0,
+      expectedTotalBytes
+    });
+
+    response.json({
+      jobId,
+      chunkSizeBytes: COMPRESS_STREAM_CHUNK_BYTES
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/jobs/compress-stream/:jobId/chunk", async (request, response, next) => {
+  const jobId = request.params.jobId;
+  const session = compressStreamSessions.get(jobId);
+
+  if (!session) {
+    response.status(404).json({ error: "Upload session not found or already finalized." });
+    return;
+  }
+
+  try {
+    const chunkIndex = Number(request.headers["x-chunk-index"]);
+
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+      response.status(400).json({ error: "X-Chunk-Index header must be a non-negative integer." });
+      return;
+    }
+
+    if (chunkIndex !== session.nextChunkIndex) {
+      response
+        .status(400)
+        .json({ error: `Invalid chunk order: expected index ${session.nextChunkIndex}, got ${chunkIndex}.` });
+      return;
+    }
+
+    const flags = chunkIndex === 0 ? "w" : "a";
+    const writeStream = createWriteStream(session.inputPath, { flags });
+
+    try {
+      await pipeline(request, writeStream);
+    } catch (error) {
+      compressStreamSessions.delete(jobId);
+      await cleanupPath(session.dirPath);
+      throw error;
+    }
+
+    const stats = await fs.stat(session.inputPath);
+    session.nextChunkIndex += 1;
+
+    response.json({
+      ok: true,
+      receivedBytes: stats.size,
+      nextChunkIndex: session.nextChunkIndex
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/jobs/compress-stream/:jobId/finalize", async (request, response, next) => {
+  try {
+    const jobId = request.params.jobId;
+    const session = compressStreamSessions.get(jobId);
+
+    if (!session) {
+      response.status(404).json({ error: "Upload session not found or already finalized." });
+      return;
+    }
+
+    let stats;
+    try {
+      stats = await fs.stat(session.inputPath);
+    } catch {
+      response.status(400).json({ error: "Uploaded file is missing." });
+      return;
+    }
+
+    if (stats.size !== session.expectedTotalBytes) {
+      response.status(400).json({
+        error: `Size mismatch: expected ${session.expectedTotalBytes} bytes, got ${stats.size}.`
+      });
+      return;
+    }
+
+    compressStreamSessions.delete(jobId);
+
+    const outputName = resolveCompressOutputName(session.originalName, session.metadata);
+    const record = createJobRecord({
+      id: jobId,
+      mode: "compress",
+      baseDir: session.dirPath,
+      outputName
+    });
+
+    jobs.set(record.id, record);
+    appendLog(record, `Queued compression for ${session.originalName} (chunked stream upload).`);
+
+    const file = {
+      path: session.inputPath,
+      originalname: session.originalName
+    };
+
+    runCompressPipeline(record, file, session.metadata);
+
+    response.status(202).json({ jobId: record.id });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post(
+  "/api/jobs/compress",
+  assignUploadJobId,
+  compressUpload.single("videoFile"),
+  async (request, response, next) => {
+    try {
+      const file = request.file;
+
+      if (!file) {
+        throw new Error("videoFile is required.");
+      }
+
+      const metadata = parseCompressMetadata(request.body?.metadata);
+      const outputName = resolveCompressOutputName(file.originalname, metadata);
+      const record = createJobRecord({
+        id: request.uploadJobId,
+        mode: "compress",
+        baseDir: path.join(UPLOADS_DIR, request.uploadJobId),
+        outputName
+      });
+
+      jobs.set(record.id, record);
+      appendLog(record, `Queued compression for ${file.originalname}.`);
+
+      runCompressPipeline(record, file, metadata);
+
+      response.status(202).json({ jobId: record.id });
+    } catch (error) {
+      await cleanupPath(path.join(UPLOADS_DIR, request.uploadJobId));
+      next(error);
+    }
+  }
+);
 
 app.post(
   "/api/jobs/upload",
@@ -189,9 +423,12 @@ if (hasBuiltFrontend) {
 }
 
 const port = Number(process.env.PORT || 3001);
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Video tool API listening on http://localhost:${port}`);
 });
+
+server.requestTimeout = 3_600_000;
+server.headersTimeout = 3_610_000;
 
 function assignUploadJobId(request, _response, next) {
   request.uploadJobId = randomUUID();
@@ -210,7 +447,9 @@ function createJobRecord({ id, mode, baseDir, outputName = null }) {
     error: null,
     baseDir,
     startedAt: new Date().toISOString(),
-    finishedAt: null
+    finishedAt: null,
+    progressPercent: null,
+    progressLabel: null
   };
 }
 
@@ -230,14 +469,64 @@ async function runUploadPipeline(record, metadata, files) {
   });
 }
 
+async function runCompressPipeline(record, file, metadata) {
+  const uploadDir = path.join(UPLOADS_DIR, record.id);
+  const outputPath = path.join(OUTPUTS_DIR, `${record.id}-${record.outputName}`);
+
+  record.status = "running";
+  record.progressPercent = 0;
+  record.progressLabel = "Encoding";
+
+  try {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+
+    await compressVideo({
+      inputPath: file.path,
+      outputPath,
+      crf: metadata.crf,
+      preset: metadata.preset,
+      audioBitrate: metadata.audioBitrate,
+      convertFormat: metadata.convertFormat,
+      onProgress(percent) {
+        record.progressPercent = percent;
+        record.progressLabel = "Encoding";
+      },
+      onLog(message) {
+        appendLog(record, message);
+      }
+    });
+
+    record.status = "completed";
+    record.outputPath = outputPath;
+    record.downloadUrl = `/api/jobs/${record.id}/download`;
+    record.finishedAt = new Date().toISOString();
+    record.progressPercent = 100;
+    record.progressLabel = "Done";
+  } catch (error) {
+    record.status = "failed";
+    record.error = error.message;
+    record.finishedAt = new Date().toISOString();
+    record.progressLabel = "Failed";
+    appendLog(record, error.message);
+  } finally {
+    await cleanupPath(uploadDir);
+  }
+}
+
 async function runPipeline(record, job, baseDir, options = {}) {
   record.status = "running";
+  record.progressPercent = 0;
+  record.progressLabel = "Encoding";
 
   try {
     const result = await runJob(job, baseDir, {
       configLabel: options.configLabel,
       onLog(message) {
         appendLog(record, message);
+      },
+      onProgress(percent) {
+        record.progressPercent = percent;
+        record.progressLabel = "Encoding";
       }
     });
 
@@ -245,10 +534,13 @@ async function runPipeline(record, job, baseDir, options = {}) {
     record.outputPath = result.outputPath;
     record.downloadUrl = `/api/jobs/${record.id}/download`;
     record.finishedAt = new Date().toISOString();
+    record.progressPercent = 100;
+    record.progressLabel = "Done";
   } catch (error) {
     record.status = "failed";
     record.error = error.message;
     record.finishedAt = new Date().toISOString();
+    record.progressLabel = "Failed";
     appendLog(record, error.message);
   } finally {
     await Promise.all((options.cleanupPaths || []).map((targetPath) => cleanupPath(targetPath)));
@@ -281,6 +573,131 @@ function buildUploadJob(record, metadata, files) {
       removeAudio: Boolean(clip.removeAudio)
     }))
   };
+}
+
+function defaultCompressMetadata() {
+  return {
+    outputName: null,
+    crf: 23,
+    preset: "medium",
+    audioBitrate: "128k",
+    convertFormat: false,
+    targetFormat: "mp4"
+  };
+}
+
+function normalizeCompressMetadataObject(metadata) {
+  if (!metadata || typeof metadata !== "object") {
+    return defaultCompressMetadata();
+  }
+
+  const crf = metadata.crf != null ? Number(metadata.crf) : 23;
+  const preset = metadata.preset != null ? String(metadata.preset) : "medium";
+  const audioBitrate = metadata.audioBitrate != null ? String(metadata.audioBitrate) : "128k";
+
+  if (!Number.isFinite(crf)) {
+    throw new Error("metadata.crf must be a number.");
+  }
+
+  const convertFormat = Boolean(metadata.convertFormat);
+  const targetFormat =
+    typeof metadata.targetFormat === "string"
+      ? metadata.targetFormat.trim().toLowerCase().replace(/^\./, "")
+      : "mp4";
+
+  return {
+    outputName: typeof metadata.outputName === "string" ? metadata.outputName : null,
+    crf,
+    preset,
+    audioBitrate,
+    convertFormat,
+    targetFormat
+  };
+}
+
+function parseCompressMetadataFromInitBody(rawMeta) {
+  if (rawMeta == null) {
+    return defaultCompressMetadata();
+  }
+
+  if (typeof rawMeta === "object" && !Array.isArray(rawMeta)) {
+    return normalizeCompressMetadataObject(rawMeta);
+  }
+
+  if (typeof rawMeta === "string") {
+    return parseCompressMetadata(rawMeta);
+  }
+
+  throw new Error("metadata must be an object or JSON string.");
+}
+
+function parseCompressMetadata(rawMetadata) {
+  if (!rawMetadata) {
+    return defaultCompressMetadata();
+  }
+
+  if (typeof rawMetadata === "object" && !Array.isArray(rawMetadata)) {
+    return normalizeCompressMetadataObject(rawMetadata);
+  }
+
+  if (typeof rawMetadata !== "string") {
+    throw new Error("metadata must be a string or object.");
+  }
+
+  let metadata;
+
+  try {
+    metadata = JSON.parse(rawMetadata);
+  } catch {
+    throw new Error("metadata must be valid JSON.");
+  }
+
+  if (!metadata || typeof metadata !== "object") {
+    throw new Error("metadata must be an object.");
+  }
+
+  return normalizeCompressMetadataObject(metadata);
+}
+
+function resolveCompressOutputName(originalFilename, metadata) {
+  const origExt = path.extname(originalFilename).toLowerCase();
+
+  if (!origExt || !VIDEO_EXTENSIONS.has(origExt)) {
+    throw new Error(`Unsupported input extension: ${origExt || "(none)"}`);
+  }
+
+  const trimmed = typeof metadata.outputName === "string" ? metadata.outputName.trim() : "";
+  const fallbackBase = "compressed";
+  const rawBase = trimmed ? sanitizeFilename(trimmed) : fallbackBase;
+  const nameWithoutExt = path.basename(rawBase, path.extname(rawBase)) || fallbackBase;
+
+  if (metadata.convertFormat) {
+    const targetExt = normalizeTargetVideoExtension(metadata.targetFormat);
+    return `${nameWithoutExt}${targetExt}`;
+  }
+
+  const requestedExt = path.extname(rawBase).toLowerCase();
+
+  if (!requestedExt) {
+    return `${nameWithoutExt}${origExt}`;
+  }
+
+  if (requestedExt !== origExt) {
+    return `${nameWithoutExt}${origExt}`;
+  }
+
+  return rawBase;
+}
+
+function normalizeTargetVideoExtension(targetFormat) {
+  const token = (targetFormat || "mp4").toString().trim().toLowerCase().replace(/^\./, "");
+  const ext = `.${token}`;
+
+  if (!VIDEO_EXTENSIONS.has(ext)) {
+    throw new Error(`Unsupported target format: ${ext}`);
+  }
+
+  return ext;
 }
 
 function parseUploadMetadata(rawMetadata) {

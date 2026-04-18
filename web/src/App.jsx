@@ -1,10 +1,29 @@
-import { startTransition, useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import { getCompressEstimates } from "./compress-estimate.js";
 
 const PRESET_OPTIONS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"];
+const TARGET_FORMAT_OPTIONS = [
+  { value: "mp4", label: "MP4 (.mp4)" },
+  { value: "mov", label: "QuickTime (.mov)" },
+  { value: "m4v", label: "M4V (.m4v)" },
+  { value: "mkv", label: "Matroska (.mkv)" },
+  { value: "webm", label: "WebM (.webm)" },
+  { value: "avi", label: "AVI (.avi)" }
+];
 const MIN_TRIM_GAP = 0.05;
+
+/** Above this size, skip <video> preview — decoding large blobs often crashes Chrome (e.g. error 5). */
+const MAX_BROWSER_VIDEO_PREVIEW_BYTES = 72 * 1024 * 1024;
+
+/**
+ * Single-request browser uploads above this often crash Chrome (error 5) or time out — use CLI instead.
+ * (Chunked/resumable upload is not implemented in this app.)
+ */
+const MAX_BROWSER_SINGLE_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 export default function App() {
   const fileInputRef = useRef(null);
+  const compressInputRef = useRef(null);
   const videoRefs = useRef({});
   const latestClipsRef = useRef([]);
 
@@ -16,6 +35,11 @@ export default function App() {
   const [downloadName, setDownloadName] = useState("merged-video.mp4");
   const [serverMessage, setServerMessage] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [workflow, setWorkflow] = useState("merge");
+  const [compress, setCompress] = useState(createDefaultCompressState());
+  const [transferPercent, setTransferPercent] = useState(null);
+  const [processPercent, setProcessPercent] = useState(null);
+  const [processLabel, setProcessLabel] = useState(null);
 
   useEffect(() => {
     let ignore = false;
@@ -31,6 +55,13 @@ export default function App() {
 
         startTransition(() => {
           setJob(createJobFromDefaults(data.browserDefaults));
+          if (data.compressorDefaults) {
+            setCompress((current) => ({
+              ...current,
+              ...createDefaultCompressState(),
+              ...data.compressorDefaults
+            }));
+          }
         });
       } catch (error) {
         if (!ignore) {
@@ -57,6 +88,15 @@ export default function App() {
     []
   );
 
+  useEffect(
+    () => () => {
+      if (compress.previewUrl) {
+        URL.revokeObjectURL(compress.previewUrl);
+      }
+    },
+    [compress.previewUrl]
+  );
+
   useEffect(() => {
     if (!jobId) {
       return undefined;
@@ -72,6 +112,8 @@ export default function App() {
         setServerMessage(data.error || "");
         setDownloadUrl(data.downloadUrl || "");
         setDownloadName(data.outputName || "merged-video.mp4");
+        setProcessPercent(typeof data.progressPercent === "number" ? data.progressPercent : null);
+        setProcessLabel(typeof data.progressLabel === "string" ? data.progressLabel : null);
 
         if (data.status === "completed" || data.status === "failed") {
           clearInterval(timer);
@@ -87,14 +129,26 @@ export default function App() {
 
   async function handleRunJob() {
     if (!job.clips.length) {
-      setServerMessage("Pehle videos upload karein.");
+      setServerMessage("Upload at least one video first.");
+      return;
+    }
+
+    const oversized = job.clips.filter((clip) => isFileTooLargeForBrowserUpload(clip.file));
+    if (oversized.length) {
+      setServerMessage(
+        `One or more clips exceed the browser upload limit (${formatBytes(MAX_BROWSER_SINGLE_UPLOAD_BYTES)} per file). Use the CLI instead. Example: video-tool run ./your-job.json`
+      );
       return;
     }
 
     setServerMessage("");
+    setJobId(null);
     setJobStatus("submitting");
     setJobLogs([]);
     setDownloadUrl("");
+    setTransferPercent(0);
+    setProcessPercent(null);
+    setProcessLabel(null);
 
     try {
       const formData = new FormData();
@@ -104,19 +158,54 @@ export default function App() {
         formData.append("clipFiles", clip.file, clip.file.name);
       }
 
-      const response = await fetch("/api/jobs/upload", {
-        method: "POST",
-        body: formData
+      const data = await postFormDataWithProgress("/api/jobs/upload", formData, (percent) => {
+        startTransition(() => setTransferPercent(percent));
       });
-      const data = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.error || "Merge job start nahi ho saka.");
-      }
-
+      setTransferPercent(null);
       setJobId(data.jobId);
       setJobStatus("queued");
     } catch (error) {
+      setTransferPercent(null);
+      setJobStatus("failed");
+      setServerMessage(error.message);
+    }
+  }
+
+  async function handleRunCompress() {
+    if (!compress.file) {
+      setServerMessage("Select a video file first.");
+      return;
+    }
+
+    setServerMessage("");
+    setJobId(null);
+    setJobStatus("submitting");
+    setJobLogs([]);
+    setDownloadUrl("");
+    setTransferPercent(0);
+    setProcessPercent(null);
+    setProcessLabel(null);
+
+    try {
+      const metadataPayload = {
+        outputName: compress.outputName.trim() || undefined,
+        crf: Number(compress.crf),
+        preset: compress.preset,
+        audioBitrate: compress.audioBitrate,
+        convertFormat: Boolean(compress.convertFormat),
+        targetFormat: compress.convertFormat ? compress.targetFormat : undefined
+      };
+
+      const data = await uploadCompressInChunks(compress.file, metadataPayload, (percent) => {
+        startTransition(() => setTransferPercent(percent));
+      });
+
+      setTransferPercent(null);
+      setJobId(data.jobId);
+      setJobStatus("queued");
+    } catch (error) {
+      setTransferPercent(null);
       setJobStatus("failed");
       setServerMessage(error.message);
     }
@@ -128,7 +217,7 @@ export default function App() {
       .map((file) => createClipFromFile(file));
 
     if (!nextClips.length) {
-      setServerMessage("Sirf video files select karein.");
+      setServerMessage("Please select video files only.");
       return;
     }
 
@@ -379,13 +468,24 @@ export default function App() {
       .then((data) => {
         destroyClipResources(job.clips);
 
+        if (compress.previewUrl) {
+          URL.revokeObjectURL(compress.previewUrl);
+        }
+
         startTransition(() => {
           setJob(createJobFromDefaults(data.browserDefaults));
+          setCompress({
+            ...createDefaultCompressState(),
+            ...(data.compressorDefaults || {})
+          });
           setJobId(null);
           setJobStatus("idle");
           setJobLogs([]);
           setDownloadUrl("");
           setServerMessage("");
+          setTransferPercent(null);
+          setProcessPercent(null);
+          setProcessLabel(null);
         });
       })
       .catch((error) => {
@@ -393,30 +493,204 @@ export default function App() {
       });
   }
 
+  function handleWorkflowChange(nextWorkflow) {
+    setWorkflow(nextWorkflow);
+    setServerMessage("");
+  }
+
+  function handleCompressFileSelected(fileList) {
+    const file = Array.from(fileList || []).find((candidate) => isVideoFile(candidate));
+
+    if (!file) {
+      setServerMessage("Please select a video file only.");
+      return;
+    }
+
+    setServerMessage("");
+
+    setCompress((current) => {
+      if (current.previewUrl) {
+        URL.revokeObjectURL(current.previewUrl);
+      }
+
+      return {
+        ...current,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        outputName: buildDefaultCompressOutputName(file.name, current.convertFormat, current.targetFormat)
+      };
+    });
+  }
+
+  function updateCompressField(field, value) {
+    setCompress((current) => ({
+      ...current,
+      [field]: value
+    }));
+  }
+
+  function setCompressConvertFormat(enabled) {
+    setCompress((current) => {
+      const next = { ...current, convertFormat: enabled };
+      if (current.file) {
+        next.outputName = buildDefaultCompressOutputName(current.file.name, enabled, current.targetFormat);
+      }
+      return next;
+    });
+  }
+
+  function setCompressTargetFormat(format) {
+    setCompress((current) => {
+      const next = { ...current, targetFormat: format };
+      if (current.convertFormat && current.file) {
+        next.outputName = buildDefaultCompressOutputName(current.file.name, true, format);
+      }
+      return next;
+    });
+  }
+
   const totalDurationHint = `${job.clips.length} clip${job.clips.length === 1 ? "" : "s"} ready`;
+
+  const compressEstimate = useMemo(() => {
+    if (workflow !== "compress" || !compress.file) {
+      return null;
+    }
+
+    const crfNumber = compress.crf === "" || compress.crf == null ? 23 : Number(compress.crf);
+
+    if (!Number.isFinite(crfNumber)) {
+      return null;
+    }
+
+    const outputExtension = compress.convertFormat
+      ? `.${String(compress.targetFormat).replace(/^\./, "").toLowerCase()}`
+      : getVideoExtension(compress.file.name);
+    const inputExtension = getVideoExtension(compress.file.name);
+
+    return getCompressEstimates({
+      inputBytes: compress.file.size,
+      crf: crfNumber,
+      preset: compress.preset,
+      inputExtension: inputExtension || undefined,
+      outputExtension: outputExtension || undefined,
+      convertFormat: Boolean(compress.convertFormat)
+    });
+  }, [workflow, compress.file, compress.crf, compress.preset, compress.convertFormat, compress.targetFormat]);
+
+  const compressHeroSummary = useMemo(() => {
+    if (workflow !== "compress" || !compress.file) {
+      return null;
+    }
+    const inExt = getVideoExtension(compress.file.name) || "(unknown)";
+    const targetDot =
+      compress.convertFormat && `.${String(compress.targetFormat).replace(/^\./, "").toLowerCase()}`;
+    const outputSummary = compress.convertFormat
+      ? `Convert + compress → ${targetDot}`
+      : `Same container as input (${inExt})`;
+    const estimatePart = compressEstimate
+      ? ` · ~${formatBytes(compressEstimate.estimatedBytes)} est. size, ~${compressEstimate.qualityReductionPercent}% est. quality reduction`
+      : "";
+    return `${compress.file.name} · ${formatBytes(compress.file.size)} · ${outputSummary}${estimatePart} (upload uses chunked streaming)`;
+  }, [workflow, compress.file, compress.convertFormat, compress.targetFormat, compressEstimate]);
+
+  const mergeUploadBlocked = job.clips.some((clip) => clip.file && isFileTooLargeForBrowserUpload(clip.file));
+
+  const showProgressBar =
+    transferPercent != null ||
+    (jobId != null &&
+      typeof processPercent === "number" &&
+      (jobStatus === "running" || jobStatus === "queued" || jobStatus === "submitting" || jobStatus === "completed"));
+
+  const progressBarPercent =
+    transferPercent != null ? transferPercent : Math.min(100, Math.max(0, processPercent ?? 0));
+
+  const progressCaption =
+    transferPercent != null
+      ? `Uploading ${transferPercent}%`
+      : typeof processPercent === "number"
+        ? `${processLabel || "Processing"} ${processPercent}%`
+        : "";
 
   return (
     <div className="app-shell">
       <header className="hero">
         <div className="hero-copy-wrap">
-          <p className="eyebrow">No Technical Setup Needed</p>
-          <h1>Upload Videos. Arrange. Merge.</h1>
+          <p className="eyebrow">AI Video Workflow Foundation</p>
+          <div className="workflow-tabs" role="tablist" aria-label="Tool workflow">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={workflow === "merge"}
+              className={`workflow-tab ${workflow === "merge" ? "workflow-tab-active" : ""}`}
+              onClick={() => handleWorkflowChange("merge")}
+            >
+              Clip merge
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={workflow === "compress"}
+              className={`workflow-tab ${workflow === "compress" ? "workflow-tab-active" : ""}`}
+              onClick={() => handleWorkflowChange("compress")}
+            >
+              Video compressor
+            </button>
+          </div>
+          <h1>Build The Base For AI-Narrated Videos.</h1>
           <p className="hero-copy">
-            Har clip ka video yahin dikhega. Player se frame dekh kar start aur end set kar sakte
-            hain, ya timeline sliders se visual cut kar sakte hain.
+            This workspace covers clip editing, merge export, and single-file compression. Later phases
+            can add AI scripts, voices, text-to-speech, and narration aligned to the timeline.
           </p>
         </div>
 
         <div className="status-panel">
           <span className={`status-pill status-${jobStatus}`}>{jobStatus}</span>
-          <p>{downloadUrl ? "Final video ready hai. Download button use karein." : totalDurationHint}</p>
+          {showProgressBar ? (
+            <div className="progress-wrap" aria-live="polite">
+              <div className="progress-bar" role="progressbar" aria-valuenow={progressBarPercent} aria-valuemin={0} aria-valuemax={100}>
+                <div className="progress-fill" style={{ width: `${progressBarPercent}%` }} />
+              </div>
+              <p className="progress-caption">{progressCaption}</p>
+            </div>
+          ) : null}
+          <p>
+            {downloadUrl
+              ? "Output is ready — use Download below."
+              : workflow === "compress"
+                ? compress.file
+                  ? compressHeroSummary
+                  : "Pick one video for compression."
+                : totalDurationHint}
+          </p>
           <div className="hero-actions">
-            <button type="button" className="primary-button" onClick={handleRunJob}>
-              Merge Videos
-            </button>
-            <button type="button" className="secondary-button" onClick={openFilePicker}>
-              Browse Videos
-            </button>
+            {workflow === "merge" ? (
+              <button
+                type="button"
+                className="primary-button"
+                onClick={handleRunJob}
+                disabled={mergeUploadBlocked}
+                title={
+                  mergeUploadBlocked
+                    ? `Each clip must be under ${formatBytes(MAX_BROWSER_SINGLE_UPLOAD_BYTES)} for browser upload`
+                    : undefined
+                }
+              >
+                Merge Videos
+              </button>
+            ) : (
+              <button type="button" className="primary-button" onClick={handleRunCompress}>
+                Compress Video
+              </button>
+            )}
+            {workflow === "merge" ? (
+              <button type="button" className="secondary-button" onClick={openFilePicker}>
+                Browse Videos
+              </button>
+            ) : (
+              <button type="button" className="secondary-button" onClick={() => compressInputRef.current?.click()}>
+                Browse Video
+              </button>
+            )}
             <button type="button" className="ghost-button" onClick={resetJob}>
               Reset
             </button>
@@ -429,6 +703,18 @@ export default function App() {
         </div>
       </header>
 
+      <input
+        ref={compressInputRef}
+        className="hidden-input"
+        type="file"
+        accept="video/*,.mp4,.mov,.mkv,.avi,.webm,.m4v"
+        onChange={(event) => {
+          handleCompressFileSelected(event.target.files);
+          event.target.value = "";
+        }}
+      />
+
+      {workflow === "merge" ? (
       <main className="layout-grid">
         <section className="stack">
           <article className="panel upload-panel">
@@ -458,24 +744,39 @@ export default function App() {
               onDragLeave={() => setIsDragging(false)}
               onDrop={handleDrop}
             >
-              <strong>Videos ko yahan drag and drop karein</strong>
-              <p>ya Browse button se files choose karein</p>
+              <strong>Drag and drop videos here</strong>
+              <p>or choose files with Browse</p>
               <button type="button" className="dropzone-button" onClick={openFilePicker}>
                 Browse Files
               </button>
             </div>
 
             <div className="quick-notes">
-              <p>System har uploaded file ko ek clip samjhega.</p>
-              <p>Player se current frame par ja kar start aur end set kiya ja sakta hai.</p>
+              <p>Each uploaded file becomes one clip in order.</p>
+              <p>Trimming is visual-only for now; narration sync can come in a later phase.</p>
             </div>
+            {mergeUploadBlocked ? (
+              <div className="upload-limit-banner">
+                <strong>Clip too large for browser upload</strong>
+                <p>
+                  At least one file is over {formatBytes(MAX_BROWSER_SINGLE_UPLOAD_BYTES)}. The web UI sends the whole
+                  file in one request, which often crashes Chrome (Aw, Snap / error 5) or times out. Prepare a JSON job
+                  and run from a terminal:
+                </p>
+                <pre className="cli-snippet">
+                  {`video-tool init ./my-job.json
+# edit my-job.json clip paths, then:
+video-tool run ./my-job.json`}
+                </pre>
+              </div>
+            ) : null}
           </article>
 
           <article className="panel">
             <div className="panel-heading">
               <div>
                 <p className="panel-kicker">Step 2</p>
-                <h2>Visual Clip Trimming</h2>
+                <h2>Visual Timeline Base</h2>
               </div>
             </div>
 
@@ -486,6 +787,7 @@ export default function App() {
                     key={clip.id}
                     clip={clip}
                     index={index}
+                    maxPreviewBytes={MAX_BROWSER_VIDEO_PREVIEW_BYTES}
                     setVideoRef={setVideoRef}
                     onMetadata={handleClipMetadata}
                     onTimeUpdate={handleClipTimeUpdate}
@@ -501,8 +803,8 @@ export default function App() {
                 ))
               ) : (
                 <div className="empty-state">
-                  <strong>Abhi koi video upload nahi hui.</strong>
-                  <p>Browse Videos button ya drag and drop use karein.</p>
+                  <strong>No videos uploaded yet.</strong>
+                  <p>Use Browse Videos or drag and drop.</p>
                 </div>
               )}
             </div>
@@ -514,7 +816,7 @@ export default function App() {
             <div className="panel-heading">
               <div>
                 <p className="panel-kicker">Step 3</p>
-                <h2>Final Output</h2>
+                <h2>Output And Future Narration Layer</h2>
               </div>
             </div>
 
@@ -533,9 +835,13 @@ export default function App() {
                   checked={Boolean(job.removeAudio)}
                   onChange={(event) => updateTopLevel("removeAudio", event.target.checked)}
                 />
-                <span>Remove all audio from final video</span>
+                <span>Remove current audio from final video</span>
               </label>
             </div>
+            <p className="clip-meta">
+              Planned later: generated narration audio, AI voice selection, and auto-sync with the
+              final timeline.
+            </p>
           </article>
 
           <article className="panel">
@@ -620,10 +926,210 @@ export default function App() {
             </div>
 
             {serverMessage ? <p className="error-banner">{serverMessage}</p> : null}
-            <pre className="log-panel">{jobLogs.length ? jobLogs.join("\n") : "Merge start karne ke baad logs yahan aayenge."}</pre>
+            <pre className="log-panel">{jobLogs.length ? jobLogs.join("\n") : "Logs appear here after you start a merge."}</pre>
           </article>
         </aside>
       </main>
+      ) : (
+      <main className="layout-grid">
+        <section className="stack">
+          <article className="panel upload-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="panel-kicker">Compressor</p>
+                <h2>Shrink One File</h2>
+              </div>
+              <span className="summary-chip">
+                {compress.convertFormat
+                  ? `Convert + compress → .${String(compress.targetFormat).replace(/^\./, "")}`
+                  : "Same container as input (e.g. MP4 → MP4)"}
+              </span>
+            </div>
+
+            <div
+              className={`dropzone ${isDragging ? "dropzone-active" : ""}`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setIsDragging(true);
+              }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setIsDragging(false);
+                handleCompressFileSelected(event.dataTransfer.files);
+              }}
+            >
+              <strong>Drop a video here</strong>
+              <p>
+                {compress.convertFormat
+                  ? "Output will use the target container you select below."
+                  : "Output keeps the same extension as the source file."}{" "}
+                Large files are sent in sequential chunks so the browser does not load the whole file at once.
+              </p>
+              <button type="button" className="dropzone-button" onClick={() => compressInputRef.current?.click()}>
+                Browse One Video
+              </button>
+            </div>
+
+            {compress.file ? (
+              <div className="compress-preview">
+                {isVideoPreviewTooHeavy(compress.file) ? (
+                  <div className="preview-disabled-notice">
+                    <strong>Preview disabled</strong>
+                    <p>
+                      This file is about {formatBytes(compress.file.size)}. Playing it in the browser can crash Chrome
+                      (error 5 / out of memory). Compression still runs on the server — adjust settings below and run
+                      compress.
+                    </p>
+                  </div>
+                ) : (
+                  <video
+                    className="clip-video"
+                    src={compress.previewUrl}
+                    controls
+                    playsInline
+                    preload="none"
+                  />
+                )}
+                <p className="clip-meta">
+                  {compress.convertFormat
+                    ? "The server forces the output extension to your selected target format."
+                    : "If the file name extension does not match the source, the server corrects it to match the input."}
+                </p>
+              </div>
+            ) : null}
+          </article>
+
+          <article className="panel">
+            <div className="panel-heading">
+              <div>
+                <p className="panel-kicker">Settings</p>
+                <h2>Encode Options</h2>
+              </div>
+            </div>
+
+            {compress.file && compressEstimate ? (
+              <div className="estimate-card">
+                <p className="estimate-title">
+                  Rough size estimate (MOV/MKV → MP4 assumes a much smaller H.264 delivery than source)
+                </p>
+                <div className="estimate-metrics">
+                  <div className="estimate-block">
+                    <span className="estimate-label">Estimated compressed size</span>
+                    <strong className="estimate-value">~{formatBytes(compressEstimate.estimatedBytes)}</strong>
+                    <span className="estimate-range">
+                      Range ~{formatBytes(compressEstimate.estimatedLowBytes)} –{" "}
+                      {formatBytes(compressEstimate.estimatedHighBytes)}
+                    </span>
+                    <span className="estimate-muted">
+                      Original {formatBytes(compress.file.size)}
+                      {compressEstimate.savingsPercent > 0 ? (
+                        <>
+                          {" "}
+                          · ~{compressEstimate.savingsPercent}% smaller file
+                          {compressEstimate.percentOfOriginal
+                            ? ` (~${compressEstimate.percentOfOriginal}% of original size)`
+                            : ""}
+                        </>
+                      ) : null}
+                      {compressEstimate.growthPercent > 0 ? (
+                        <> · ~{compressEstimate.growthPercent}% larger possible (lower CRF)</>
+                      ) : null}
+                    </span>
+                  </div>
+                  <div className="estimate-block">
+                    <span className="estimate-label">Estimated visual quality loss</span>
+                    <strong className="estimate-value">~{compressEstimate.qualityReductionPercent}%</strong>
+                    <span className="estimate-muted">
+                      ~{compressEstimate.qualityRetainedPercent}% vs a near-lossless reference (heuristic from CRF and
+                      preset)
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="field-grid single-column">
+              <label className="toggle-field">
+                <input
+                  type="checkbox"
+                  checked={Boolean(compress.convertFormat)}
+                  onChange={(event) => setCompressConvertFormat(event.target.checked)}
+                />
+                <span>Convert container while compressing (for example MOV → MP4)</span>
+              </label>
+              {compress.convertFormat ? (
+                <label className="field">
+                  <span>Target format</span>
+                  <select
+                    value={compress.targetFormat}
+                    onChange={(event) => setCompressTargetFormat(event.target.value)}
+                  >
+                    {TARGET_FORMAT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              <label className="field">
+                <span>Output file name</span>
+                <input
+                  value={compress.outputName}
+                  onChange={(event) => updateCompressField("outputName", event.target.value)}
+                  placeholder="compressed.mp4"
+                />
+              </label>
+              <label className="field">
+                <span>CRF (quality)</span>
+                <input
+                  type="number"
+                  value={compress.crf}
+                  onChange={(event) => updateCompressField("crf", event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Preset</span>
+                <select
+                  value={compress.preset}
+                  onChange={(event) => updateCompressField("preset", event.target.value)}
+                >
+                  {PRESET_OPTIONS.map((preset) => (
+                    <option key={preset} value={preset}>
+                      {preset}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Audio bitrate</span>
+                <input
+                  value={compress.audioBitrate}
+                  onChange={(event) => updateCompressField("audioBitrate", event.target.value)}
+                />
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <aside className="stack">
+          <article className="panel">
+            <div className="panel-heading">
+              <div>
+                <p className="panel-kicker">Runtime</p>
+                <h2>Job Logs</h2>
+              </div>
+            </div>
+
+            {serverMessage ? <p className="error-banner">{serverMessage}</p> : null}
+            <pre className="log-panel">
+              {jobLogs.length ? jobLogs.join("\n") : "Logs appear here after you start compression."}
+            </pre>
+          </article>
+        </aside>
+      </main>
+      )}
     </div>
   );
 }
@@ -631,6 +1137,7 @@ export default function App() {
 function ClipCard({
   clip,
   index,
+  maxPreviewBytes,
   setVideoRef,
   onMetadata,
   onTimeUpdate,
@@ -650,6 +1157,8 @@ function ClipCard({
   const startPercent = durationSeconds ? (selectionStart / durationSeconds) * 100 : 0;
   const endPercent = durationSeconds ? (selectionEnd / durationSeconds) * 100 : 0;
   const playheadPercent = durationSeconds ? (playhead / durationSeconds) * 100 : 0;
+  const skipHeavyPreview =
+    typeof maxPreviewBytes === "number" && clip.file && clip.file.size > maxPreviewBytes;
 
   return (
     <div className="clip-card">
@@ -677,16 +1186,27 @@ function ClipCard({
       </div>
 
       <div className="clip-preview">
-        <video
-          ref={(node) => setVideoRef(clip.id, node)}
-          className="clip-video"
-          src={clip.previewUrl}
-          controls
-          preload="metadata"
-          onLoadedMetadata={(event) => onMetadata(index, event)}
-          onTimeUpdate={(event) => onTimeUpdate(index, event)}
-          onSeeked={(event) => onTimeUpdate(index, event)}
-        />
+        {skipHeavyPreview ? (
+          <div className="preview-disabled-notice">
+            <strong>Preview disabled ({formatBytes(clip.file.size)})</strong>
+            <p>
+              In-browser playback is turned off for very large files to avoid Chrome crashes. Use Start / End /
+              Duration fields below, or split the file into smaller parts.
+            </p>
+          </div>
+        ) : (
+          <video
+            ref={(node) => setVideoRef(clip.id, node)}
+            className="clip-video"
+            src={clip.previewUrl}
+            controls
+            playsInline
+            preload="none"
+            onLoadedMetadata={(event) => onMetadata(index, event)}
+            onTimeUpdate={(event) => onTimeUpdate(index, event)}
+            onSeeked={(event) => onTimeUpdate(index, event)}
+          />
+        )}
 
         <div className="timeline-summary">
           <span>
@@ -755,7 +1275,11 @@ function ClipCard({
             </div>
           </>
         ) : (
-          <p className="clip-meta">Video duration load ho rahi hai...</p>
+          <p className="clip-meta">
+            {skipHeavyPreview
+              ? "No timeline preview without in-browser video — use Start / End / Duration fields."
+              : "Loading duration…"}
+          </p>
         )}
       </div>
 
@@ -1073,6 +1597,152 @@ function isVideoFile(file) {
       file.name.toLowerCase().endsWith(extension)
     )
   );
+}
+
+function getVideoExtension(filename) {
+  const lower = String(filename).toLowerCase();
+  const match = [".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"].find((extension) => lower.endsWith(extension));
+  return match || "";
+}
+
+function buildDefaultCompressOutputName(filename, convertFormat, targetFormat) {
+  const token = String(targetFormat || "mp4")
+    .trim()
+    .toLowerCase()
+    .replace(/^\./, "");
+  const targetExt = `.${token}`;
+
+  if (convertFormat) {
+    return `compressed${targetExt}`;
+  }
+
+  const inputExt = getVideoExtension(filename);
+  if (inputExt) {
+    return `compressed${inputExt}`;
+  }
+
+  return `compressed${targetExt}`;
+}
+
+function createDefaultCompressState() {
+  return {
+    file: null,
+    previewUrl: "",
+    outputName: "compressed.mp4",
+    crf: 23,
+    preset: "medium",
+    audioBitrate: "128k",
+    convertFormat: false,
+    targetFormat: "mp4"
+  };
+}
+
+async function readJsonResponseBody(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+async function uploadCompressInChunks(file, metadata, onProgress) {
+  const initResponse = await fetch("/api/jobs/compress-stream/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      originalName: file.name,
+      totalBytes: file.size,
+      metadata
+    })
+  });
+  const initBody = await readJsonResponseBody(initResponse);
+
+  if (!initResponse.ok) {
+    throw new Error(initBody.error || "Could not start chunked upload.");
+  }
+
+  const jobId = initBody.jobId;
+  const chunkSize = initBody.chunkSizeBytes || 16 * 1024 * 1024;
+  let offset = 0;
+  let chunkIndex = 0;
+
+  onProgress?.(0);
+
+  while (offset < file.size) {
+    const end = Math.min(offset + chunkSize, file.size);
+    const slice = file.slice(offset, end);
+    const chunkResponse = await fetch(`/api/jobs/compress-stream/${jobId}/chunk`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Chunk-Index": String(chunkIndex)
+      },
+      body: slice
+    });
+    const chunkBody = await readJsonResponseBody(chunkResponse);
+
+    if (!chunkResponse.ok) {
+      throw new Error(chunkBody.error || `Upload chunk ${chunkIndex} failed.`);
+    }
+
+    offset = end;
+    chunkIndex += 1;
+    onProgress?.(Math.min(100, Math.round((offset / file.size) * 100)));
+  }
+
+  const finalizeResponse = await fetch(`/api/jobs/compress-stream/${jobId}/finalize`, {
+    method: "POST"
+  });
+  const finalizeBody = await readJsonResponseBody(finalizeResponse);
+
+  if (!finalizeResponse.ok) {
+    throw new Error(finalizeBody.error || "Could not finalize upload.");
+  }
+
+  return finalizeBody;
+}
+
+function postFormDataWithProgress(url, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && typeof onProgress === "function") {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    });
+
+    xhr.onerror = () => {
+      reject(new Error("Network error"));
+    };
+
+    xhr.onload = () => {
+      let body = {};
+      try {
+        body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+      } catch {
+        body = {};
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body);
+        return;
+      }
+
+      reject(new Error(body.error || `Request failed (${xhr.status})`));
+    };
+
+    xhr.send(formData);
+  });
+}
+
+function isVideoPreviewTooHeavy(file) {
+  return Boolean(file && file.size > MAX_BROWSER_VIDEO_PREVIEW_BYTES);
+}
+
+function isFileTooLargeForBrowserUpload(file) {
+  return Boolean(file && file.size > MAX_BROWSER_SINGLE_UPLOAD_BYTES);
 }
 
 function formatBytes(bytes) {
